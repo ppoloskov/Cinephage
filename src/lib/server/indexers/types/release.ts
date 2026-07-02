@@ -327,6 +327,8 @@ export interface SearchResult {
 	indexerResults: IndexerSearchResult[];
 	/** Indexers that were rejected from this search */
 	rejectedIndexers?: RejectedIndexer[];
+	/** Pipeline trace data (populated by searchEnhanced) */
+	trace?: Record<string, unknown>;
 }
 
 /**

@@ -338,7 +338,8 @@ export const GET: RequestHandler = async ({ url }) => {
 					])
 				),
 				rejectedIndexers: searchResult.rejectedIndexers
-			}
+			},
+			trace: searchResult.trace
 		});
 	}
 

@@ -12,6 +12,7 @@ import type {
 	RejectedIndexer,
 	EnhancedReleaseResult
 } from '../types';
+import type { TraceResult, StageSummary, ReleaseTraceEntry } from '../types/debug';
 import {
 	hasSearchableIds,
 	createIdOnlyCriteria,
@@ -120,6 +121,8 @@ export interface EnhancedSearchResult {
 	rejectedIndexers?: RejectedIndexer[];
 	/** Scoring profile used for quality scoring */
 	scoringProfileId?: string;
+	/** Pipeline trace data — always present for enriched searches */
+	trace?: TraceResult;
 }
 
 /** Resolved options after merging with defaults */
@@ -415,6 +418,9 @@ export class SearchOrchestrator {
 			? { ...criteria, searchSource: opts.searchSource }
 			: criteria;
 
+		// Initialize trace collector
+		const trace = new TraceCollector(startTime);
+
 		logger.debug(
 			{
 				criteria: criteriaToString(criteriaWithSource),
@@ -430,6 +436,27 @@ export class SearchOrchestrator {
 		]);
 
 		const { eligible: eligibleIndexers, rejected: rejectedIndexers } = indexerFilterResult;
+
+		// Stage: filterIndexers
+		trace.registerStage('filterIndexers');
+		{
+			const rejectedByReason = rejectedIndexers.reduce(
+				(acc, r) => {
+					acc[r.reason] = acc[r.reason] || [];
+					acc[r.reason].push(r.indexerName);
+					return acc;
+				},
+				{} as Record<string, string[]>
+			);
+			trace.setStageMetadata('filterIndexers', {
+				totalIndexers: indexers.length,
+				eligible: eligibleIndexers.length,
+				rejected: rejectedIndexers.length,
+				rejectedByReason
+			});
+			trace.setStageInput('filterIndexers', 0);
+			trace.setStageOutput('filterIndexers', 0, 0);
+		}
 
 		if (opts.useCache && opts.searchSource === 'interactive') {
 			const cacheKey = this.cache.generateKey(enrichedCriteria);
@@ -470,7 +497,8 @@ export class SearchOrchestrator {
 				enrichTimeMs: 0,
 				fromCache: false,
 				indexerResults: [],
-				rejectedIndexers
+				rejectedIndexers,
+				trace: trace.build()
 			};
 		}
 
@@ -491,6 +519,24 @@ export class SearchOrchestrator {
 
 		const searchTimeMs = Date.now() - startTime;
 
+		// Stage: executeSearches
+		trace.registerStage('executeSearches');
+		{
+			const errors = indexerResults
+				.filter((r) => r.error)
+				.map((r) => ({ indexer: r.indexerName, error: r.error }));
+			trace.setStageMetadata('executeSearches', {
+				indexersQueried: indexerResults.length,
+				totalRawReleases: allReleases.length,
+				errors
+			});
+			trace.setStageInput('executeSearches', allReleases.length);
+			trace.setStageOutput('executeSearches', allReleases.length, 0);
+			for (const release of allReleases) {
+				trace.recordEntered(release, 'executeSearches');
+			}
+		}
+
 		logger.debug(
 			{
 				indexerCounts: indexerResults.map((r) => ({
@@ -504,8 +550,32 @@ export class SearchOrchestrator {
 		);
 
 		// Pass 1: Basic deduplication (by infoHash/title, prefer more seeders)
+		const beforeDedupGuids = new Set(allReleases.map((r) => r.guid));
 		const { releases: deduped } = this.deduplicator.deduplicate(allReleases);
 		const afterDedupCount = deduped.length;
+		const afterDedupGuids = new Set(deduped.map((r) => r.guid));
+
+		// Stage: deduplicate
+		trace.registerStage('deduplicate');
+		{
+			trace.setStageInput('deduplicate', allReleases.length);
+			const droppedCount = allReleases.length - deduped.length;
+			trace.setStageOutput('deduplicate', deduped.length, droppedCount);
+			trace.setStageMetadata('deduplicate', { duplicatesRemoved: droppedCount });
+			for (const guid of beforeDedupGuids) {
+				if (!afterDedupGuids.has(guid)) {
+					const dropped = allReleases.find((r) => r.guid === guid);
+					if (dropped) {
+						trace.recordDropped(dropped, 'deduplicate', 'Duplicate removed', 'duplicate');
+					}
+				} else {
+					const survived = deduped.find((r) => r.guid === guid);
+					if (survived) {
+						trace.recordPassed(survived, 'deduplicate');
+					}
+				}
+			}
+		}
 
 		// Get TV episode counts from TMDB for season-pack size validation and
 		// RuTracker season-pack completion gating.
@@ -535,11 +605,49 @@ export class SearchOrchestrator {
 		}
 
 		// Filter by season/episode if specified
+		const beforeSeasonEpisodeGuids = new Set(deduped.map((r) => r.guid));
 		let filtered = this.filterBySeasonEpisode(deduped, enrichedCriteria, {
 			seasonEpisodeCount,
 			seasonEpisodeCounts
 		});
 		const afterSeasonEpisodeCount = filtered.length;
+		const afterSeasonEpisodeGuids = new Set(filtered.map((r) => r.guid));
+
+		// Stage: filterBySeasonEpisode
+		trace.registerStage('filterBySeasonEpisode');
+		{
+			const droppedCount = deduped.length - filtered.length;
+			trace.setStageInput('filterBySeasonEpisode', deduped.length);
+			trace.setStageOutput('filterBySeasonEpisode', filtered.length, droppedCount);
+			for (const guid of beforeSeasonEpisodeGuids) {
+				if (!afterSeasonEpisodeGuids.has(guid)) {
+					const dropped = deduped.find((r) => r.guid === guid);
+					if (dropped) {
+						if (isMovieSearch(enrichedCriteria)) {
+							trace.recordDropped(
+								dropped,
+								'filterBySeasonEpisode',
+								'Rejecting TV release for movie search',
+								'tvReleaseInMovieSearch'
+							);
+						} else {
+							trace.recordDropped(
+								dropped,
+								'filterBySeasonEpisode',
+								'Release does not match season/episode criteria',
+								'seasonEpisodeMismatch'
+							);
+						}
+					}
+				} else {
+					const survived = filtered.find((r) => r.guid === guid);
+					if (survived) {
+						trace.recordPassed(survived, 'filterBySeasonEpisode');
+					}
+				}
+			}
+		}
+
 		logger.debug(
 			{ afterSeasonEpisode: afterSeasonEpisodeCount },
 			'[SearchOrchestrator] DEBUG: after season/episode filter'
@@ -549,18 +657,80 @@ export class SearchOrchestrator {
 		// Skip for season-only TV searches: the season/episode filter already validated
 		// these releases as season packs, and indexer categories are an unreliable signal
 		// for packs (see isSeasonOnlyTvSearch).
-		if (enrichedCriteria.searchType !== 'basic' && !this.isSeasonOnlyTvSearch(enrichedCriteria)) {
+		const categoryFilterSkipped =
+			enrichedCriteria.searchType === 'basic' || this.isSeasonOnlyTvSearch(enrichedCriteria);
+		const beforeCategoryGuids = new Set(filtered.map((r) => r.guid));
+		if (!categoryFilterSkipped) {
 			const searchType = enrichedCriteria.searchType as 'movie' | 'tv' | 'music' | 'book';
 			filtered = this.filterByCategoryMatch(filtered, searchType, enrichedCriteria);
 		}
 		const afterCategoryCount = filtered.length;
+		const afterCategoryGuids = new Set(filtered.map((r) => r.guid));
+
+		// Stage: filterByCategoryMatch
+		trace.registerStage('filterByCategoryMatch');
+		{
+			const droppedCount = beforeCategoryGuids.size - afterCategoryGuids.size;
+			trace.setStageInput('filterByCategoryMatch', beforeCategoryGuids.size);
+			trace.setStageOutput('filterByCategoryMatch', filtered.length, droppedCount);
+			for (const guid of beforeCategoryGuids) {
+				if (!afterCategoryGuids.has(guid)) {
+					const dropped =
+						allReleases.find((r) => r.guid === guid) ??
+						deduped.find((r) => r.guid === guid);
+					if (dropped) {
+						const catStr = dropped.categories && dropped.categories.length > 0
+							? `Category ${dropped.categories[0]} does not match search type '${enrichedCriteria.searchType}'`
+							: 'Category does not match search type';
+						trace.recordDropped(dropped, 'filterByCategoryMatch', catStr, 'categoryMismatch');
+					}
+				} else {
+					const survived = filtered.find((r) => r.guid === guid);
+					if (survived) {
+						trace.recordPassed(survived, 'filterByCategoryMatch');
+					}
+				}
+			}
+		}
+
 		logger.debug(
 			{ afterCategory: afterCategoryCount },
 			'[SearchOrchestrator] DEBUG: after category filter'
 		);
 
+		const beforeNonVideoGuids = new Set(filtered.map((r) => r.guid));
 		filtered = this.filterOutNonVideoArtifacts(filtered, enrichedCriteria);
 		const afterNonVideoCount = filtered.length;
+		const afterNonVideoGuids = new Set(filtered.map((r) => r.guid));
+
+		// Stage: filterOutNonVideoArtifacts
+		trace.registerStage('filterOutNonVideoArtifacts');
+		{
+			const droppedCount = beforeNonVideoGuids.size - filtered.length;
+			trace.setStageInput('filterOutNonVideoArtifacts', beforeNonVideoGuids.size);
+			trace.setStageOutput('filterOutNonVideoArtifacts', filtered.length, droppedCount);
+			for (const guid of beforeNonVideoGuids) {
+				if (!afterNonVideoGuids.has(guid)) {
+					const dropped =
+						allReleases.find((r) => r.guid === guid) ??
+						deduped.find((r) => r.guid === guid);
+					if (dropped) {
+						trace.recordDropped(
+							dropped,
+							'filterOutNonVideoArtifacts',
+							'Rejecting non-video artifact release',
+							'nonVideoArtifact'
+						);
+					}
+				} else {
+					const survived = filtered.find((r) => r.guid === guid);
+					if (survived) {
+						trace.recordPassed(survived, 'filterOutNonVideoArtifacts');
+					}
+				}
+			}
+		}
+
 		logger.debug(
 			{ afterNonVideo: afterNonVideoCount },
 			'[SearchOrchestrator] DEBUG: after non-video filter'
@@ -568,17 +738,100 @@ export class SearchOrchestrator {
 
 		// Hard filter by ID match with title+year fallback.
 		// Also validates title relevance for releases without IDs.
-		if (isMovieSearch(enrichedCriteria) || isTvSearch(enrichedCriteria)) {
+		const idTitleFilterSkipped = !(isMovieSearch(enrichedCriteria) || isTvSearch(enrichedCriteria));
+		const beforeIdTitleGuids = new Set(filtered.map((r) => r.guid));
+		if (!idTitleFilterSkipped) {
 			filtered = this.filterByIdOrTitleMatch(filtered, enrichedCriteria);
 		}
 		const afterIdTitleCount = filtered.length;
+		const afterIdTitleGuids = new Set(filtered.map((r) => r.guid));
+
+		// Stage: filterByIdOrTitleMatch
+		trace.registerStage('filterByIdOrTitleMatch');
+		{
+			const droppedCount = beforeIdTitleGuids.size - filtered.length;
+			trace.setStageInput('filterByIdOrTitleMatch', beforeIdTitleGuids.size);
+			trace.setStageOutput('filterByIdOrTitleMatch', filtered.length, droppedCount);
+			for (const guid of beforeIdTitleGuids) {
+				if (!afterIdTitleGuids.has(guid)) {
+					const dropped =
+						allReleases.find((r) => r.guid === guid) ??
+						deduped.find((r) => r.guid === guid);
+					if (dropped) {
+						trace.recordDropped(
+							dropped,
+							'filterByIdOrTitleMatch',
+							'Title/year mismatch',
+							'yearMismatch'
+						);
+					}
+				} else {
+					const survived = filtered.find((r) => r.guid === guid);
+					if (survived) {
+						trace.recordPassed(survived, 'filterByIdOrTitleMatch');
+					}
+				}
+			}
+		}
+
 		logger.debug(
 			{ afterIdTitle: afterIdTitleCount },
 			'[SearchOrchestrator] DEBUG: after ID/title filter'
 		);
 
 		// Boost releases matching preferred language before enrichment
+		const beforeBoostGuids = new Set(filtered.map((r) => r.guid));
+		const preferredLanguage = enrichedCriteria.language;
+		const boostActive = preferredLanguage && preferredLanguage !== 'en' && filtered.length > 0;
+
+		// Detect which releases will be boosted before the mutation
+		const preBoostSeeders = new Map<string, number>();
+		const boostedGuids = new Set<string>();
+		if (boostActive) {
+			for (const r of filtered) {
+				const beforeSeeders = typeof (r as { seeders?: number }).seeders === 'number' ? (r as { seeders?: number }).seeders! : 0;
+				preBoostSeeders.set(r.guid, beforeSeeders);
+				const { languages } = extractLanguages(r.title);
+				if (languages.includes(preferredLanguage)) {
+					boostedGuids.add(r.guid);
+				}
+			}
+		}
+
 		filtered = this.boostByLanguage(filtered, enrichedCriteria);
+
+		// Stage: boostByLanguage
+		trace.registerStage('boostByLanguage');
+		{
+			let transformedCount = 0;
+			trace.setStageInput('boostByLanguage', beforeBoostGuids.size);
+			trace.setStageOutput('boostByLanguage', filtered.length, 0);
+
+			for (const release of filtered) {
+				if (boostedGuids.has(release.guid)) {
+					const beforeSeeders = preBoostSeeders.get(release.guid) ?? 0;
+					// Compute what the boost would have produced (mirrors boostByLanguage logic)
+					const afterSeeders =
+						typeof release.seeders === 'number'
+							? release.seeders
+							: Math.max(1, beforeSeeders * 30);
+					trace.recordTransformed(release, 'boostByLanguage', 'languageBoost', {
+						language: preferredLanguage!,
+						totalScoreBefore: beforeSeeders,
+						totalScoreAfter: afterSeeders
+					});
+					transformedCount++;
+				}
+				// Record passed for all releases (none dropped at this stage)
+				trace.recordPassed(release, 'boostByLanguage');
+			}
+
+			trace.setStageTransformed('boostByLanguage', transformedCount);
+			trace.setStageMetadata('boostByLanguage', {
+				preferredLanguage: preferredLanguage ?? null,
+				releasesBoosted: transformedCount
+			});
+		}
 
 		const afterFilteringCount = filtered.length;
 
@@ -616,26 +869,108 @@ export class SearchOrchestrator {
 			indexerConfigs
 		};
 
+		const beforeEnrichGuids = new Set(filtered.map((r) => r.guid));
 		const enrichResult = await releaseEnricher.enrich(filtered, enrichmentOpts);
+
+		// Stage: enrich
+		trace.registerStage('enrich');
+		{
+			trace.setStageInput('enrich', beforeEnrichGuids.size);
+			trace.setStageOutput('enrich', enrichResult.releases.length, 0);
+
+			let rejectedByQuality = 0;
+			let rejectedByProtocol = 0;
+			let rejectedBySize = 0;
+			let rejectedByBanned = 0;
+
+			const enrichReleaseByGuid = new Map(enrichResult.releases.map((r) => [r.guid, r]));
+
+			for (const guid of beforeEnrichGuids) {
+				const enhanced = enrichReleaseByGuid.get(guid);
+				if (enhanced) {
+					if (enhanced.rejected) {
+						// Categorize the rejection for metadata
+						const rType = enhanced.rejectionType?.toLowerCase() ?? '';
+						if (rType === 'size' || enhanced.rejectionReason?.toLowerCase().includes('size') || enhanced.rejections?.some((r: string) => r.toLowerCase().includes('size'))) {
+							rejectedBySize++;
+						} else if (rType === 'protocol' || enhanced.rejectionReason?.toLowerCase().includes('protocol') || enhanced.rejections?.some((r: string) => r.toLowerCase().includes('protocol'))) {
+							rejectedByProtocol++;
+						} else if (rType === 'banned' || enhanced.rejectionReason?.toLowerCase().includes('banned') || enhanced.rejections?.some((r: string) => r.toLowerCase().includes('banned'))) {
+							rejectedByBanned++;
+						} else {
+							rejectedByQuality++;
+						}
+					}
+					// Record passed for all releases (rejected releases continue through pipeline)
+					trace.recordPassed(enhanced, 'enrich');
+				}
+			}
+
+			trace.setStageMetadata('enrich', {
+				rejectedByQuality,
+				rejectedByProtocol,
+				rejectedBySize,
+				rejectedByBanned
+			});
+		}
 
 		// Pass 2: Enhanced deduplication using Radarr-style preference logic
 		// Now that we have rejection counts, prefer releases with fewer rejections and higher indexer priority
+		const beforeEnhancedDedupGuids = new Set(enrichResult.releases.map((r) => r.guid));
 		const { releases: smartDeduped } = this.deduplicator.deduplicateEnhanced(enrichResult.releases);
 		const afterEnrichmentCount = smartDeduped.length;
+		const afterEnhancedDedupGuids = new Set(smartDeduped.map((r) => r.guid));
 
-		logger.debug(
-			{
-				beforeDedup: enrichResult.releases.length,
-				afterDedup: smartDeduped.length,
-				removed: enrichResult.releases.length - smartDeduped.length
-			},
-			'[SearchOrchestrator] After enhanced deduplication'
-		);
+		// Stage: deduplicateEnhanced
+		trace.registerStage('deduplicateEnhanced');
+		{
+			const droppedCount = enrichResult.releases.length - smartDeduped.length;
+			trace.setStageInput('deduplicateEnhanced', enrichResult.releases.length);
+			trace.setStageOutput('deduplicateEnhanced', smartDeduped.length, droppedCount);
+			const enrichReleaseByGuid = new Map(enrichResult.releases.map((r) => [r.guid, r]));
+			for (const guid of beforeEnhancedDedupGuids) {
+				if (!afterEnhancedDedupGuids.has(guid)) {
+					const dropped = enrichReleaseByGuid.get(guid);
+					if (dropped) {
+						trace.recordDropped(dropped, 'deduplicateEnhanced', 'Duplicate: prefer release with fewer rejections', 'duplicatePreferred');
+					}
+				} else {
+					const survived = smartDeduped.find((r) => r.guid === guid);
+					if (survived) {
+						trace.recordPassed(survived, 'deduplicateEnhanced');
+					}
+				}
+			}
+		}
 
 		// Apply limit (releases are already sorted by totalScore from enricher)
 		const limited = enrichedCriteria.limit
 			? smartDeduped.slice(0, enrichedCriteria.limit)
 			: smartDeduped;
+		const truncatedCount = enrichedCriteria.limit ? Math.max(0, smartDeduped.length - enrichedCriteria.limit) : 0;
+
+		// Stage: sortAndRank
+		trace.registerStage('sortAndRank');
+		{
+			trace.setStageInput('sortAndRank', smartDeduped.length);
+			trace.setStageOutput('sortAndRank', limited.length, truncatedCount);
+			trace.setStageMetadata('sortAndRank', {
+				limit: enrichedCriteria.limit ?? null,
+				truncated: truncatedCount > 0 ? truncatedCount : 0
+			});
+			for (const release of limited) {
+				trace.recordPassed(release, 'sortAndRank');
+			}
+			// Record truncated releases as dropped
+			if (truncatedCount > 0) {
+				const keptGuids = new Set(limited.map((r) => r.guid));
+				for (const release of smartDeduped) {
+					if (!keptGuids.has(release.guid)) {
+						trace.recordDropped(release, 'sortAndRank', 'Truncated by result limit', 'truncated');
+					}
+				}
+			}
+		}
 
 		// Assign releaseWeight (position in final sorted results, 1 = best)
 		const withWeights = limited.map((release, index) => ({
@@ -661,7 +996,8 @@ export class SearchOrchestrator {
 			fromCache: false,
 			indexerResults,
 			rejectedIndexers,
-			scoringProfileId: enrichResult.scoringProfile?.id
+			scoringProfileId: enrichResult.scoringProfile?.id,
+			trace: trace.build()
 		};
 
 		if (opts.useCache && opts.searchSource === 'interactive' && withWeights.length > 0) {
@@ -2936,6 +3272,161 @@ export class SearchOrchestrator {
 		}
 
 		return criteria;
+	}
+}
+
+/**
+ * Internal trace collector for the enhanced search pipeline.
+ * Tracks per-release events through each pipeline stage.
+ */
+class TraceCollector {
+	private stageOrder: string[] = [];
+	private stages: Record<string, StageSummary> = {};
+	private releaseTrace: Record<string, ReleaseTraceEntry[]> = {};
+	private startTime: number;
+	private stageIndex = 0;
+
+	constructor(startTime: number) {
+		this.startTime = startTime;
+	}
+
+	/** Register a pipeline stage before execution */
+	registerStage(name: string): void {
+		this.stageOrder.push(name);
+	}
+
+	/** Record input count for a stage (before filter runs) */
+	setStageInput(name: string, count: number): void {
+		this.ensureStage(name);
+		this.stages[name].inputCount = count;
+		this.stages[name].outputCount = count; // will be updated after
+	}
+
+	/** Record output after stage completes */
+	setStageOutput(name: string, outputCount: number, droppedCount: number): void {
+		const stage = this.ensureStage(name);
+		stage.outputCount = outputCount;
+		stage.droppedCount = droppedCount;
+	}
+
+	/** Set stage metadata */
+	setStageMetadata(name: string, metadata: Record<string, unknown>): void {
+		const stage = this.ensureStage(name);
+		stage.metadata = { ...stage.metadata, ...metadata };
+	}
+
+	/** Set transformed count */
+	setStageTransformed(name: string, count: number): void {
+		const stage = this.ensureStage(name);
+		stage.transformedCount = count;
+	}
+
+	/** Set stage duration */
+	setStageDuration(name: string, durationMs: number): void {
+		const stage = this.ensureStage(name);
+		stage.durationMs = durationMs;
+	}
+
+	/** Record a release entering the pipeline (first time seen) */
+	recordEntered(
+		release: { guid: string; title: string; indexerId: string; indexerName: string },
+		stageName: string
+	): void {
+		const entries = this.ensureRelease(release);
+		entries.push({
+			stage: stageName,
+			event: 'entered',
+			ts: Date.now() - this.startTime,
+			title: release.title,
+			indexerId: release.indexerId,
+			indexerName: release.indexerName
+		});
+	}
+
+	/** Record a release passing a filter stage */
+	recordPassed(
+		release: { guid: string; title: string; indexerId: string; indexerName: string },
+		stageName: string
+	): void {
+		const entries = this.ensureRelease(release);
+		entries.push({
+			stage: stageName,
+			event: 'passed',
+			ts: Date.now() - this.startTime,
+			title: release.title,
+			indexerId: release.indexerId,
+			indexerName: release.indexerName
+		});
+	}
+
+	/** Record a release being dropped at a stage */
+	recordDropped(
+		release: { guid: string; title: string; indexerId: string; indexerName: string },
+		stageName: string,
+		reason: string,
+		reasonCategory: string
+	): void {
+		const entries = this.ensureRelease(release);
+		entries.push({
+			stage: stageName,
+			event: 'dropped',
+			ts: Date.now() - this.startTime,
+			title: release.title,
+			indexerId: release.indexerId,
+			indexerName: release.indexerName,
+			reason,
+			reasonCategory
+		});
+	}
+
+	/** Record a release being transformed at a stage */
+	recordTransformed(
+		release: { guid: string; title: string; indexerId: string; indexerName: string },
+		stageName: string,
+		transformation: string,
+		detail?: Record<string, unknown>
+	): void {
+		const entries = this.ensureRelease(release);
+		entries.push({
+			stage: stageName,
+			event: 'transformed',
+			ts: Date.now() - this.startTime,
+			title: release.title,
+			indexerId: release.indexerId,
+			indexerName: release.indexerName,
+			transformation,
+			transformationDetail: detail
+		});
+	}
+
+	/** Build the final TraceResult */
+	build(): TraceResult {
+		return {
+			stageOrder: this.stageOrder,
+			stages: this.stages,
+			releaseTrace: this.releaseTrace
+		};
+	}
+
+	private ensureStage(
+		name: string
+	): StageSummary {
+		if (!this.stages[name]) {
+			this.stages[name] = {
+				index: this.stageIndex++,
+				inputCount: 0,
+				outputCount: 0,
+				droppedCount: 0
+			};
+		}
+		return this.stages[name];
+	}
+
+	private ensureRelease(release: { guid: string }): ReleaseTraceEntry[] {
+		if (!this.releaseTrace[release.guid]) {
+			this.releaseTrace[release.guid] = [];
+		}
+		return this.releaseTrace[release.guid];
 	}
 }
 
